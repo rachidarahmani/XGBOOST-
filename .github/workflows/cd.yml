@@ -1,0 +1,100 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-3
+  ECR_API: wine-api
+  ECR_UI: wine-streamlit
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest -v
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vérifier que le modèle est présent
+        run: test -f models/wine_model.joblib
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build et push de l'API
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/${{ env.ECR_API }}
+          docker build -t $IMAGE:${{ github.sha }} .
+          docker push $IMAGE:${{ github.sha }}
+
+      - name: Build et push de Streamlit
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/${{ env.ECR_UI }}
+          docker build -t $IMAGE:${{ github.sha }} ./streamlit_app
+          docker push $IMAGE:${{ github.sha }}
+
+      # --- Déploiement ECS Express Mode (remplace App Runner, fermé aux nouveaux clients) ---
+      - name: Déployer l'API
+        id: deploy_api
+        uses: aws-actions/amazon-ecs-deploy-express-service@v1
+        with:
+          service-name: wine-api
+          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_API }}:${{ github.sha }}
+          execution-role-arn: ${{ secrets.ECS_EXECUTION_ROLE_ARN }}
+          infrastructure-role-arn: ${{ secrets.ECS_INFRASTRUCTURE_ROLE_ARN }}
+          container-port: 8000
+          health-check-path: /health
+          cpu: "512"
+          memory: "1024"
+
+      - name: Calculer l'URL de l'API
+        id: api_url
+        run: |
+          URL="${{ steps.deploy_api.outputs.endpoint }}"
+          case "$URL" in http*) ;; *) URL="https://$URL" ;; esac
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "API : $URL"
+
+      - name: Déployer Streamlit
+        id: deploy_ui
+        uses: aws-actions/amazon-ecs-deploy-express-service@v1
+        with:
+          service-name: wine-streamlit
+          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_UI }}:${{ github.sha }}
+          execution-role-arn: ${{ secrets.ECS_EXECUTION_ROLE_ARN }}
+          infrastructure-role-arn: ${{ secrets.ECS_INFRASTRUCTURE_ROLE_ARN }}
+          container-port: 8501
+          health-check-path: /_stcore/health
+          cpu: "512"
+          memory: "1024"
+          environment-variables: |
+            [{"name": "API_URL", "value": "${{ steps.api_url.outputs.url }}"}]
+
+      - name: Résumé
+        run: |
+          echo "### Déploiement terminé" >> "$GITHUB_STEP_SUMMARY"
+          echo "- API : ${{ steps.api_url.outputs.url }}/docs" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Streamlit : ${{ steps.deploy_ui.outputs.endpoint }}" >> "$GITHUB_STEP_SUMMARY"
